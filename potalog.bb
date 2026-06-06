@@ -24,22 +24,23 @@
 (defn qso? [s]
   (re-matches #"<call.*" s))
 
-(let [qsos (->>
-             log-file
-             slurp
-             str/split-lines
-             (filter qso?)
-             (map parse-adi-qso)
-             )]
-  (println "File: " log-file)
-  (println qsos)
+(try
+  (let [qsos (->>
+               log-file
+               slurp
+               str/split-lines
+               (filter qso?)
+               (map parse-adi-qso)
+               )]
+    (println "File:" log-file)
 
-  (->>
-    qsos
-    (map (juxt :call :band :mode))
-    sort
-    (map cons (drop 1 (range)))
-    (map (partial str/join "\t"))
-    (map println )
-    doall))
+    (->>
+      qsos
+      (map (juxt :call :band :mode))
+      sort
+      (map cons (drop 1 (range)))
+      (map (partial str/join "\t"))
+      (map println )
+      doall))
+  (catch Exception e (println "no log:" log-file)))
 
