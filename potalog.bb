@@ -1,9 +1,12 @@
 #!/usr/bin/env bb
 
 (ns pota-log
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str])
+  (:import [java.time ZonedDateTime ZoneOffset]
+           [java.time.format DateTimeFormatter])
+       )
 
-(def log-file "/home/john/.local/share/WSJT-X - pota/wsjtx_log.adi")
+(def log-file "/home/john/.local/share/WSJT-X/wsjtx_log.adi")
 
 (defn parse-adi-qso [s]
   (->
@@ -24,15 +27,22 @@
 (defn qso? [s]
   (re-matches #"<call.*" s))
 
+(defn format-time [t]
+  (->> t (partition 2) (map str/join) (str/join ":")))
+
 (try
   (let [qsos (->>
-               log-file
-               slurp
-               str/split-lines
-               (filter qso?)
-               (map parse-adi-qso)
-               )]
+              log-file
+              slurp
+              str/split-lines
+              (filter qso?)
+              (map parse-adi-qso)
+              )]
     (println "File:" log-file)
+    (println "First Contact:" (-> qsos first :time-on format-time))
+    (println " Last Contact:" (-> qsos last :time-on format-time))
+    (println "     Time Now:" 
+             (.format (ZonedDateTime/now ZoneOffset/UTC) (DateTimeFormatter/ofPattern "HH:mm:ss")))
 
     (->>
       qsos
@@ -40,7 +50,7 @@
       sort
       (map cons (drop 1 (range)))
       (map (partial str/join "\t"))
-      (map println )
+      (map println)
       doall))
   (catch Exception e (println "no log:" log-file)))
 
