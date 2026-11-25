@@ -6,3 +6,9 @@ Prerequisite:
 - babashka
 - mpv
 - ffmpeg
+
+## Tests
+
+```sh
+bb listen_allstar_test.bb
+```

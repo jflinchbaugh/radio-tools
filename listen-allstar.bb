@@ -19,38 +19,64 @@
           (println "Error reading duration for:" filename err))
         (System/exit 1)))))
 
+(defn id-telemetry?
+  "Returns true when a parsed log line is an ID telemetry event."
+  [event telemetry-type]
+  (and (= event "TELEMETRY")
+       (str/starts-with? (or telemetry-type "") "ID(")))
+
 (defn parse-cw-id-timestamps
   "Parses an AllStar log file to find TXKEY timestamps of CW ID-only
-  transmissions (transmissions containing ID telemetry with negligible
-  incoming RX)."
+  transmissions (MAIN transmissions with no active RX and only ID
+  telemetry between TXKEY and TXUNKEY)."
   [log-file]
   (with-open [rdr (io/reader log-file)]
     (let [id-only (atom #{})
+          active-rx (atom #{})
           curr (atom nil)]
       (doseq [line (line-seq rdr)]
-        (let [[ts event & rest-parts] (str/split (str/trim line) #",")]
-          (cond
-            (= event "TXKEY")
-            (reset! curr {:tx ts :has-id false :rx-ms 0 :last-rx nil})
+        (let [trimmed (str/trim line)]
+          (when-not (str/blank? trimmed)
+            (let [[ts event arg1 arg2] (str/split trimmed #",")]
+              (case event
+                "STARTUP"
+                (do
+                  (reset! active-rx #{})
+                  (reset! curr nil))
 
-            (= event "TXUNKEY")
-            (when-let [c @curr]
-              (let [{:keys [tx has-id rx-ms]} c]
-                (when (and has-id (< rx-ms 500))
-                  (swap! id-only conj tx))
-                (reset! curr nil)))
+                "RXKEY"
+                (do
+                  (swap! active-rx conj arg1)
+                  (when @curr
+                    (swap! curr assoc :has-other true)))
 
-            @curr
-            (do
-              (when (and (= event "TELEMETRY")
-                         (str/starts-with? (or (last rest-parts) "") "ID("))
-                (swap! curr assoc :has-id true))
-              (when (= event "RXKEY")
-                (swap! curr assoc :last-rx (Long/parseLong ts)))
-              (when (and (= event "RXUNKEY") (:last-rx @curr))
-                (let [dur (- (Long/parseLong ts) (:last-rx @curr))]
-                  (swap! curr update :rx-ms + dur)
-                  (swap! curr assoc :last-rx nil)))))))
+                "RXUNKEY"
+                (do
+                  (swap! active-rx disj arg1)
+                  (when @curr
+                    (swap! curr assoc :has-other true)))
+
+                "TXKEY"
+                (if (= arg1 "MAIN")
+                  (reset! curr {:tx ts
+                                :has-id false
+                                :has-other (boolean (seq @active-rx))})
+                  (when @curr
+                    (swap! curr assoc :has-other true)))
+
+                "TXUNKEY"
+                (if (= arg1 "MAIN")
+                  (when-let [{:keys [tx has-id has-other]} @curr]
+                    (when (and has-id (not has-other))
+                      (swap! id-only conj tx))
+                    (reset! curr nil))
+                  (when @curr
+                    (swap! curr assoc :has-other true)))
+
+                (when @curr
+                  (if (id-telemetry? event arg2)
+                    (swap! curr assoc :has-id true)
+                    (swap! curr assoc :has-other true))))))))
       @id-only)))
 
 (defn find-log-file
@@ -125,59 +151,72 @@
                      file-durations)]
     (str ";FFMETADATA1\n\n" (str/join "\n" (:chapters final-state)))))
 
-(let [args *command-line-args*]
-  (when (empty? args)
-    (println "Usage: bb listen-allstar.bb <input1.wav> <input2.wav> ...")
-    (System/exit 1))
+(when (= *file* (System/getProperty "babashka.file"))
+  (let [args *command-line-args*]
+    (when (empty? args)
+      (println "Usage: bb listen-allstar.bb <input1.wav> <input2.wav> ...")
+      (System/exit 1))
 
-  (let [filtered-args (filter-cw-id-files args)
-        skipped-count (- (count args) (count filtered-args))]
-    (when (pos? skipped-count)
-      (println (str "Filtered out " skipped-count " CW ID file(s). "
-                    (count filtered-args) " file(s) remaining.")))
-    (when (empty? filtered-args)
-      (println "No files remaining after filtering.")
-      (System/exit 0))
+    (let [filtered-args (filter-cw-id-files args)
+          skipped-count (- (count args) (count filtered-args))]
+      (when (pos? skipped-count)
+        (println (str "Filtered out " skipped-count " CW ID file(s). "
+                      (count filtered-args) " file(s) remaining.")))
+      (when (empty? filtered-args)
+        (println "No files remaining after filtering.")
+        (System/exit 0))
 
-    (let [inputs-file (io/file "ffmpeg_inputs.txt")
-          metadata-file (io/file "ffmpeg_metadata.txt")
-          output-file "output.m4a"]
+      (let [inputs-file (io/file "ffmpeg_inputs.txt")
+            metadata-file (io/file "ffmpeg_metadata.txt")
+            output-file "output.m4a"]
 
-      (println "Generating chapter metadata map...")
-      (spit metadata-file (generate-metadata-str filtered-args))
+        (println "Generating chapter metadata map...")
+        (spit metadata-file (generate-metadata-str filtered-args))
 
-      (println "Creating input manifest...")
-      (let [manifest-lines (map (fn [f]
-                                  (str "file '"
-                                       (.getAbsolutePath (io/file f))
-                                       "'"))
-                                filtered-args)]
-        (spit inputs-file (str/join "\n" manifest-lines)))
+        (println "Creating input manifest...")
+        (let [manifest-lines (map (fn [f]
+                                    (str "file '"
+                                         (.getAbsolutePath (io/file f))
+                                         "'"))
+                                  filtered-args)]
+          (spit inputs-file (str/join "\n" manifest-lines)))
 
-      (println "Running FFmpeg concatenation and encoding...")
-      (let [{:keys [exit err]} (sh "ffmpeg" "-y"
-                                   "-threads" "0"
-                                   "-f" "concat" "-safe" "0"
-                                   "-i" (str inputs-file)
-                                   "-i" (str metadata-file)
-                                   "-map_metadata" "1"
-                                   "-vn"
-                                   "-c:a" "aac" "-b:a" "128k"
-                                   output-file)]
-        ;; Clean up temporary manifest files
-        (.delete inputs-file)
-        (.delete metadata-file)
+        (println "Running FFmpeg concatenation and encoding...")
+        (let [{:keys [exit err]} (sh "ffmpeg" "-y"
+                                     "-threads" "0"
+                                     "-f" "concat" "-safe" "0"
+                                     "-i" (str inputs-file)
+                                     "-i" (str metadata-file)
+                                     "-map_metadata" "1"
+                                     "-vn"
+                                     "-c:a" "aac" "-b:a" "128k"
+                                     output-file)]
+          ;; Clean up temporary manifest files
+          (.delete inputs-file)
+          (.delete metadata-file)
 
-        (when (not (zero? exit))
-          (binding [*out* *err*]
-            (println "FFmpeg failed:\n" err))
-          (System/exit 1))
+          (when (not (zero? exit))
+            (binding [*out* *err*]
+              (println "FFmpeg failed:\n" err))
+            (System/exit 1))
 
-        (println "Success! Output generated at:" output-file))
+          (println "Success! Output generated at:" output-file))
 
-      (println "Playing with mpv...(PgUp/PgDn to skip chapters)")
-      @(process ["mpv"
-                 "--term-status-msg=Chapter: ${chapter-metadata/title} | Time: ${time-pos} / ${playtime-remaining}"
-                 "output.m4a"]
-                {:inherit true}))))
+        (println "
+Playing with mpv...
+
+Space to pause.
+PgUp/PgDn to skip chapters.
+Left/Right skip 5 seconds.
+Up/Down skip 60 seconds.
+? for help in mpv.
+
+")
+
+        @(process
+          ["mpv"
+           (str "--term-status-msg=Chapter: ${chapter-metadata/title} | "
+                "Time: ${time-pos} / ${playtime-remaining}")
+           "output.m4a"]
+          {:inherit true})))))
 
